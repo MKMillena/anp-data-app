@@ -26,7 +26,7 @@ Uma aplicação web simples e poderosa desenvolvida em Python e Streamlit para a
     ```
 3.  **Execute a aplicação**:
     ```bash
-    streamlit run app.py
+    python -m streamlit run app.py
     ```
 4.  **Acesse no navegador**:
     O app abrirá automaticamente em `http://localhost:8501`.
