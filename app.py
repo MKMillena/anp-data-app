@@ -41,9 +41,9 @@ def get_available_years():
             text = link.get_text().strip()
             href = link['href']
             
-            # Check if text is a year like "2025", "2024", etc.
-            # Regex for exact year: ^\d{4}$
-            if re.match(r'^\d{4}$', text) and '.csv' in href.lower():
+            # Check if text is a year like "2025" OR a range like "1941-1979"
+            # Regex for YYYY or YYYY-YYYY
+            if re.match(r'^\d{4}(-\d{4})?$', text) and '.csv' in href.lower():
                 # Prefer 'mar' (offshore) links if multiple exist for a year, 
                 # but usually the year text is unique per section in the list.
                 # Based on the inspection, the yearly links we saw were:
@@ -52,17 +52,10 @@ def get_available_years():
                 # We can filter for 'mar' in href to be safe if accessible.
                 
                 if 'mar' in href.lower() or 'producao_por_poco' in href.lower():
-                     try:
-                        year = int(text)
-                        # Ensure absolute URL
-                        if not href.startswith('http'):
-                            # Ideally resolve relative, but ANP usually gives absolute or root-relative
-                            pass 
-                        years_links[year] = href
-                     except ValueError:
-                        continue
+                     # Store as string to handle "1941-1979"
+                     years_links[text] = href
 
-        # Sort descending
+        # Sort descending (works for strings: "2025" > "1941...")
         return dict(sorted(years_links.items(), key=lambda item: item[0], reverse=True))
 
     except Exception as e:
@@ -262,3 +255,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
