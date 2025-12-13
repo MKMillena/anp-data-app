@@ -107,7 +107,52 @@ def process_dataframe(df):
     ]
     # Drop only those that exist
     df = df.drop(columns=[c for c in cols_to_drop if c in df.columns], errors='ignore')
-                
+
+    # --- 2. CÁLCULOS DE ENGENHARIA (NOVO CÓDIGO) ---
+    
+    # A. PREPARAÇÃO DA DATA (Essencial para 'tempo' e ordenação do 'Np')
+    # Cria uma data temporária baseada em Ano e Mês para poder ordenar
+    if 'Ano' in df.columns and 'Mês' in df.columns:
+        df['Data_Temp'] = pd.to_datetime(df['Ano'].astype(str) + '-' + df['Mês'].astype(str) + '-01', errors='coerce')
+        
+        # Ordena por Poço e Data para garantir que o acumulado e o tempo fiquem certos
+        df = df.sort_values(by=['Poço', 'Data_Temp'])
+        
+        # C. TEMPO (Dias desde o primeiro registro do poço)
+        # Agrupa por poço, pega a data mínima daquele poço e subtrai da data atual
+        df['tempo'] = df.groupby('Poço')['Data_Temp'].transform(lambda x: (x - x.min()).dt.days)
+        
+        # E. Np (Produção Acumulada de Óleo por Poço)
+        df['Np'] = df.groupby('Poço')['Produção de Óleo (m³)'].cumsum()
+        
+        # Remove a data temporária se não quiser exibir
+        df = df.drop(columns=['Data_Temp'])
+    else:
+        # Caso o CSV não tenha colunas de data (segurança)
+        df['tempo'] = 0
+        df['Np'] = 0
+
+    # B. RGO (Razão Gás-Óleo)
+    # Gás Total (Mm³ * 1000 para virar m³) / Óleo (m³)
+    # Soma Gás Associado + Não Associado
+    gas_total_m3 = (df["Produção de Gás Associado (Mm³)"] + df["Produção de Gás Não Associado (Mm³)"]) * 1000
+    df['RGO'] = gas_total_m3 / df['Produção de Óleo (m³)']
+    
+    # Tratamento de divisão por zero (se óleo for 0, RGO vira 0 ou NaN)
+    df['RGO'] = df['RGO'].replace([np.inf, -np.inf], 0).fillna(0)
+
+    # RAO (Razão Água-Óleo)
+    df['RAO'] = df['Produção de Água (m³)'] / df['Produção de Óleo (m³)']
+    df['RAO'] = df['RAO'].replace([np.inf, -np.inf], 0).fillna(0)
+
+    # D. lnq (Logaritmo Natural da Vazão de Óleo)
+    # Log de 0 é infinito, então calculamos apenas onde óleo > 0
+    df['lnq'] = np.nan # Cria a coluna vazia
+    mask_oleo_positivo = df['Produção de Óleo (m³)'] > 0
+    
+    # Aplica o Log apenas onde existe produção
+    df.loc[mask_oleo_positivo, 'lnq'] = np.log(df.loc[mask_oleo_positivo, 'Produção de Óleo (m³)'])
+    
     return df
 
 @st.cache_data(show_spinner=True)
@@ -255,4 +300,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
