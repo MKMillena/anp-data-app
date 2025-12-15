@@ -10,7 +10,7 @@ import numpy as np
 # --- HELPER FUNCTIONS ---
 
 def get_available_years():
-"""
+'''
 Scrapes the ANP website to find available years and their CSV links
 for 'Produção em mar' (Offshore).
 
@@ -21,7 +21,7 @@ content_copy
 expand_less
 Returns:
     dict: {year (int): url (str)}
-"""
+'''
 try:
     response = requests.get(DATA_URL)
     response.raise_for_status()
@@ -66,10 +66,10 @@ except Exception as e:
     return {}
 
 def process_dataframe(df):
-"""
+'''
 Cleans and processes the DataFrame:
 - Converts numerical columns from Brazilian format (1.234,56) to float (1234.56).
-"""
+'''
 
 code
 Code
@@ -202,9 +202,9 @@ except Exception as e:
     return pd.DataFrame()
 
 def to_excel(df):
-"""
+'''
 Converts DataFrame to Excel bytes.
-"""
+'''
 output = io.BytesIO()
 with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
 df.to_excel(writer, index=False, sheet_name='Sheet1')
@@ -227,7 +227,7 @@ expand_less
     worksheet.set_column(0, max_col - 1, 15)
     
 return output.getvalue()
---- MAIN APP ---
+#--- MAIN APP ---
 
 def main():
 st.set_page_config(page_title=PAGE_TITLE, layout="wide")
@@ -322,6 +322,7 @@ else:
 
 if name == "main":
 main()
+
 
 
 
