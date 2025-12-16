@@ -1,3 +1,11 @@
+import streamlit as st
+import pandas as pd
+import requests
+from bs4 import BeautifulSoup
+import io
+import re
+import numpy as np
+
 # --- CONFIG ---
 PAGE_TITLE = "ANP Produção de Petróleo e Gás"
 DATA_URL = "https://www.gov.br/anp/pt-br/centrais-de-conteudo/dados-abertos/fase-de-desenvolvimento-e-producao"
@@ -293,3 +301,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
