@@ -254,19 +254,14 @@ def main():
         # Environment Selection (based on what's available for that year)
         available_envs = annotated_years[selected_year] # e.g. {'Terra': url, 'Mar': url}
         
-        env_options = list(available_envs.keys())
-        if 'Terra' in env_options and 'Mar' in env_options:
-            display_options = ['Terra', 'Mar', 'Ambos']
-        else:
-            display_options = env_options
+        # Sort keys for consistent order usually [Mar, Terra] or [Terra, Mar]
+        display_options = sorted(list(available_envs.keys()))
             
         selected_env = st.sidebar.radio("2. Selecione o Ambiente", display_options)
         
         # Determine URLs to download
         urls_to_download = []
-        if selected_env == 'Ambos':
-            urls_to_download = [available_envs['Terra'], available_envs['Mar']]
-        elif selected_env in available_envs:
+        if selected_env in available_envs:
             urls_to_download = [available_envs[selected_env]]
             
         st.sidebar.info(f"Arquivos identificados: {len(urls_to_download)}")
