@@ -14,50 +14,67 @@ DATA_URL = "https://www.gov.br/anp/pt-br/centrais-de-conteudo/dados-abertos/fase
 
 def get_available_years():
     """
-    Scrapes the ANP website to find available years and their CSV links 
-    for 'Produção em mar' (Offshore).
-    
-    Returns:
-        dict: {year (int): url (str)}
+    Scrapes the ANP website to find available years and their CSV links,
+    categorizing them by Environment (Terra/Mar).
     """
+    years_data = {}
+    
     try:
         response = requests.get(DATA_URL)
         response.raise_for_status()
         soup = BeautifulSoup(response.content, 'html.parser')
         
-        # We are looking for links that usually look like "2024", "2023", etc.
-        # The structure inspected showed they are often in lists found under headers.
-        # We will look for all links that match a year pattern and contain 'csv' in href.
-        # Refined strategy based on inspection: Look for links with text being a year.
-        
-        years_links = {}
-        
-        # Strategies to find specific 'Produção em mar' links could be complex 
-        # without precise selectors. 
-        # Heuristic: Find all links where text is a Year (YYYY) and href ends in .csv
-        # Ideally, we would look for the section 'Produção em mar', but let's try a 
-        # slightly broader approach filtered by keywords in URL if possible, or just exact year matches.
-        
         for link in soup.find_all('a', href=True):
             text = link.get_text().strip()
             href = link['href']
+            href_lower = href.lower()
+            text_lower = text.lower()
             
-            # Check if text is a year like "2025" OR a range like "1941-1979"
-            # Regex for YYYY or YYYY-YYYY
-            if re.match(r'^\d{4}(-\d{4})?$', text) and '.csv' in href.lower():
-                # Prefer 'mar' (offshore) links if multiple exist for a year, 
-                # but usually the year text is unique per section in the list.
-                # Based on the inspection, the yearly links we saw were:
-                # "2025" -> .../producao-mar-2025.csv
-                # So if we find a year link that points to a CSV, it's a good candidate.
-                # We can filter for 'mar' in href to be safe if accessible.
+            # Find year in text (e.g. "2024", "Dados 2024", "2024-2025")
+            # Look for 4 digits starting with 19 or 20
+            year_match = re.search(r'(19|20)\d{2}', text)
+            
+            if year_match and '.csv' in href_lower:
+                year_key = year_match.group(0)
                 
-                if 'mar' in href.lower() or 'producao_por_poco' in href.lower():
-                     # Store as string to handle "1941-1979"
-                     years_links[text] = href
+                # Determine Environment (Check both HREF and TEXT)
+                env = None
+                
+                # Keywords
+                mar_keywords = ['mar', 'offshore', 'producao_mar', 'marítima']
+                terra_keywords = ['terra', 'terrestre', 'onshore', 'producao_terra']
+                
+                is_mar = any(k in href_lower for k in mar_keywords) or any(k in text_lower for k in mar_keywords)
+                is_terra = any(k in href_lower for k in terra_keywords) or any(k in text_lower for k in terra_keywords)
+                
+                if is_mar and not is_terra:
+                    env = 'Mar'
+                elif is_terra and not is_mar:
+                    env = 'Terra'
+                elif is_mar and is_terra:
+                    # Ambiguous, trust href or assign to both? 
+                    # Usually "Terra e Mar" doesn't happen in one CSV for these separate lists.
+                    # Defaulting to Mar if ambiguous might be risky, but let's see. 
+                    # If text says "Terra" and "Mar", maybe it's a combined file.
+                    # For now, if "terra" appears, treat as Terra, unless "mar" is also strong.
+                    # Let's prioritize explicit filenames.
+                    if 'mar' in href_lower:
+                        env = 'Mar'
+                    else:
+                        env = 'Terra'
+                else:
+                    # No keywords found. 
+                    # If the link text is JUST the year, maybe looking at parents/headers is needed?
+                    # But often filenames have hints (producao_mar_...).
+                    # If we can't tell, we might skip or categorize as "Indefinido".
+                    pass
 
-        # Sort descending (works for strings: "2025" > "1941...")
-        return dict(sorted(years_links.items(), key=lambda item: item[0], reverse=True))
+                if env:
+                    if year_key not in years_data:
+                        years_data[year_key] = {}
+                    years_data[year_key][env] = href
+
+        return dict(sorted(years_data.items(), key=lambda item: item[0], reverse=True))
 
     except Exception as e:
         st.error(f"Erro ao buscar dados do site: {e}")
@@ -65,8 +82,7 @@ def get_available_years():
 
 def process_dataframe(df):
     """
-    Cleans and processes the DataFrame:
-    - Converts numerical columns from Brazilian format (1.234,56) to float (1234.56).
+    Cleans and processes the DataFrame.
     """
     
     # Columns to convert
@@ -83,132 +99,140 @@ def process_dataframe(df):
         "Injeção de Vapor de Água (t)"
     ]
     
-    # Ensure they exist (intersection)
     valid_cols = [c for c in cols_to_convert if c in df.columns]
     
     for col in valid_cols:
-        # Check if already numeric
         if not pd.api.types.is_numeric_dtype(df[col]):
-            # Remove thousand separators (.) and replace decimal (,) with (.)
             try:
                 df[col] = df[col].astype(str).str.replace('.', '', regex=False).str.replace(',', '.', regex=False)
                 df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
             except Exception:
                 pass
     
-    # Remove unwanted columns
+    # Remove unwanted columns - KEEP 'Ambiente' now to distinguish Land/Sea
     cols_to_drop = [
         "Bacia", 
         "Instalação", 
         "Estado", 
-        "Ambiente", 
+        # "Ambiente",  <-- REMOVED from drop list to keep it
         "Produção de Condensado (m³)", 
         "Injeção de Polímeros (m³)", 
         "Injeção de Outros Fluidos (m³)"
     ]
-    # Drop only those that exist
     df = df.drop(columns=[c for c in cols_to_drop if c in df.columns], errors='ignore')
     
-    # --- 2. CÁLCULOS DE ENGENHARIA (NOVO CÓDIGO) ---
+    # --- CÁLCULOS DE ENGENHARIA ---
     
-    # A. PREPARAÇÃO DA DATA (Essencial para 'tempo' e ordenação do 'Np')
-    # Cria uma data temporária baseada em Ano e Mês para poder ordenar
+    # A. PREPARAÇÃO DA DATA
     if 'Ano' in df.columns and 'Mês' in df.columns:
+        # Mapeamento de meses se estiverem em texto, mas geralmente no CSV ANP 'Mês' é numérico ou texto simples.
+        # Converter para garantir.
+        # Se for string numeral "01", "1", ok. Se for "Janeiro", precisaria de map. 
+        # Assumindo numerico conforme padrão observado, mas forçando string para criar data.
+        
         df['Data_Temp'] = pd.to_datetime(df['Ano'].astype(str) + '-' + df['Mês'].astype(str) + '-01', errors='coerce')
         
-        # Ordena por Poço e Data para garantir que o acumulado e o tempo fiquem certos
+        # Ordena por Poço e Data
         df = df.sort_values(by=['Poço', 'Data_Temp'])
         
         # C. TEMPO (Dias desde o primeiro registro do poço)
-        # Agrupa por poço, pega a data mínima daquele poço e subtrai da data atual
         df['tempo'] = df.groupby('Poço')['Data_Temp'].transform(lambda x: (x - x.min()).dt.days)
         
         # E. Np (Produção Acumulada de Óleo por Poço)
+        # Converter m3 para bbl? O pedido original não especificou, manteve a unidade da coluna base (m3).
         df['Np'] = df.groupby('Poço')['Produção de Óleo (m³)'].cumsum()
         
-        # Remove a data temporária se não quiser exibir
-        df = df.drop(columns=['Data_Temp'])
+        # Manter Data_Temp para filtros de data se necessário, ou remover.
+        # Como pedido "Filtro de Mês", é bom ter Mês limpo, mas a coluna Mês original é usada.
+        # df = df.drop(columns=['Data_Temp']) 
     else:
-        # Caso o CSV não tenha colunas de data (segurança)
         df['tempo'] = 0
         df['Np'] = 0
 
     # B. RGO (Razão Gás-Óleo)
-    # Gás Total (Mm³ * 1000 para virar m³) / Óleo (m³)
-    # Soma Gás Associado + Não Associado
+    # Gás Total (Mm³ * 1000 = m³) / Óleo (m³)
     gas_total_m3 = (df["Produção de Gás Associado (Mm³)"] + df["Produção de Gás Não Associado (Mm³)"]) * 1000
-    df['RGO'] = gas_total_m3 / df['Produção de Óleo (m³)']
     
-    # Tratamento de divisão por zero (se óleo for 0, RGO vira 0 ou NaN)
-    df['RGO'] = df['RGO'].replace([np.inf, -np.inf], 0).fillna(0)
+    # Evitar divisão por zero e NaNs
+    df['RGO'] = np.where(df['Produção de Óleo (m³)'] > 0, 
+                         gas_total_m3 / df['Produção de Óleo (m³)'], 
+                         0)
 
     # RAO (Razão Água-Óleo)
-    df['RAO'] = df['Produção de Água (m³)'] / df['Produção de Óleo (m³)']
-    df['RAO'] = df['RAO'].replace([np.inf, -np.inf], 0).fillna(0)
+    df['RAO'] = np.where(df['Produção de Óleo (m³)'] > 0, 
+                         df['Produção de Água (m³)'] / df['Produção de Óleo (m³)'], 
+                         0)
 
     # D. lnq (Logaritmo Natural da Vazão de Óleo)
-    # Log de 0 é infinito, então calculamos apenas onde óleo > 0
-    df['lnq'] = np.nan # Cria a coluna vazia
+    df['lnq'] = np.nan
     mask_oleo_positivo = df['Produção de Óleo (m³)'] > 0
-    
-    # Aplica o Log apenas onde existe produção
     df.loc[mask_oleo_positivo, 'lnq'] = np.log(df.loc[mask_oleo_positivo, 'Produção de Óleo (m³)'])
 
     return df
 
-@st.cache_data(show_spinner=True)
-def load_data(url):
+@st.cache_data(show_spinner=False)
+def load_csv(url):
     """
-    Downloads CSV from URL, parses it, and caches the result.
+    Loads a single CSV from URL, cleans it, and returns a DataFrame.
+    Does NOT cache here because we might concat multiple; better to cache the higher level if efficient,
+    or rely on this being fast enough. For reliability with 'Ambos', we call this twice.
     """
     try:
-        # Based on inspection:
-        # - Separator is ','
-        # - Headers are like [Ano], [Campo]
-        # - Encoding is likely 'windows-1252' or 'latin1'
-        
         response = requests.get(url)
         response.raise_for_status()
         csv_content = io.BytesIO(response.content)
         
-        # Try reading
+        # Try reading with different encodings
         try:
              df = pd.read_csv(csv_content, sep=',', encoding='windows-1252', on_bad_lines='skip')
         except UnicodeDecodeError:
              csv_content.seek(0)
              df = pd.read_csv(csv_content, sep=',', encoding='utf-8', on_bad_lines='skip')
              
-        # CLEAN HEADERS: Remove brackets [] and whitespace
-        # Example: "[Campo]" -> "Campo"
+        # Normalize columns: remove brackets, trim whitespace
         df.columns = df.columns.str.replace(r'[\[\]]', '', regex=True).str.strip()
-             
-        df = process_dataframe(df)
-        return df
         
+        return df
     except Exception as e:
-        st.error(f"Erro ao carregar CSV: {e}")
+        st.error(f"Erro ao baixar/ler URL {url}: {e}")
         return pd.DataFrame()
 
+@st.cache_data(show_spinner=True)
+def get_dataset(urls):
+    """
+    Fetches and processes data from a list of URLs.
+    Concatenates them if multiple are provided.
+    Runs process_dataframe on the final result.
+    """
+    dfs = []
+    progress_text = "Baixando dados..."
+    my_bar = st.progress(0, text=progress_text)
+    
+    total = len(urls)
+    for i, url in enumerate(urls):
+        df_part = load_csv(url)
+        if not df_part.empty:
+            dfs.append(df_part)
+        my_bar.progress((i + 1) / total, text=f"Baixando parte {i+1} de {total}...")
+            
+    my_bar.empty()
+    
+    if not dfs:
+        return pd.DataFrame()
+        
+    final_df = pd.concat(dfs, ignore_index=True)
+    final_df = process_dataframe(final_df)
+    return final_df
+
 def to_excel(df):
-    """
-    Converts DataFrame to Excel bytes.
-    """
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
         df.to_excel(writer, index=False, sheet_name='Sheet1')
-        workbook = writer.book
         worksheet = writer.sheets['Sheet1']
-        
-        # Get dimensions
         (max_row, max_col) = df.shape
-        
-        # Create a table
         column_settings = [{'header': column} for column in df.columns]
         worksheet.add_table(0, 0, max_row, max_col - 1, {'columns': column_settings})
-        
-        # Auto-adjust columns (rough estimate)
         worksheet.set_column(0, max_col - 1, 15)
-        
     return output.getvalue()
 
 # --- MAIN APP ---
@@ -219,86 +243,103 @@ def main():
     
     st.sidebar.header("Configurações")
     
-    # 1. Select Year (Scrape available or Fallback)
-    with st.spinner("Buscando anos disponíveis no site da ANP..."):
-        available_years = get_available_years()
+    # 1. Scraping Years
+    with st.spinner("Conectando ao site da ANP..."):
+        annotated_years = get_available_years()
     
-    if available_years:
-        selected_year = st.sidebar.selectbox("Selecione o Ano", options=list(available_years.keys()))
-        csv_url = available_years[selected_year]
-        st.sidebar.info(f"Fonte: Site da ANP (Ano {selected_year})")
-    else:
-        st.warning("Não foi possível carregar os anos automaticamente. Insira o link manual se desejar.")
-        csv_url = st.sidebar.text_input("URL do CSV")
-        selected_year = None
-
-    # 2. Download Button
-    if st.sidebar.button("Baixar/Atualizar Dados da ANP"):
-        if csv_url:
-            st.session_state['data'] = load_data(csv_url)
-            st.session_state['year'] = selected_year
+    if annotated_years:
+        # Year Selection
+        selected_year = st.sidebar.selectbox("1. Selecione o Ano", options=list(annotated_years.keys()))
+        
+        # Environment Selection (based on what's available for that year)
+        available_envs = annotated_years[selected_year] # e.g. {'Terra': url, 'Mar': url}
+        
+        env_options = list(available_envs.keys())
+        if 'Terra' in env_options and 'Mar' in env_options:
+            display_options = ['Terra', 'Mar', 'Ambos']
         else:
-            st.error("Nenhuma URL válida selecionada.")
+            display_options = env_options
+            
+        selected_env = st.sidebar.radio("2. Selecione o Ambiente", display_options)
+        
+        # Determine URLs to download
+        urls_to_download = []
+        if selected_env == 'Ambos':
+            urls_to_download = [available_envs['Terra'], available_envs['Mar']]
+        elif selected_env in available_envs:
+            urls_to_download = [available_envs[selected_env]]
+            
+        st.sidebar.info(f"Arquivos identificados: {len(urls_to_download)}")
 
-    # 3. Main Data View
+        # Download Button
+        if st.sidebar.button("Baixar Dados"):
+            if urls_to_download:
+                st.session_state['data'] = get_dataset(urls_to_download)
+                st.session_state['year'] = selected_year
+                st.session_state['env'] = selected_env
+            else:
+                st.error("Erro ao identificar URLs de download.")
+
+    else:
+        st.error("Não foi possível carregar a lista de anos do site da ANP.")
+        st.warning("Verifique sua conexão ou se o site da ANP mudou de estrutura.")
+
+    # 3. Data View
     if 'data' in st.session_state and not st.session_state['data'].empty:
         df = st.session_state['data']
         
-        st.markdown(f"### Dados do Ano: {st.session_state.get('year', 'N/A')}")
-        st.write(f"Total de registros carregados: {len(df)}")
+        st.divider()
+        st.markdown(f"### 📊 Análise: {st.session_state['year']} - {st.session_state['env']}")
+        st.write(f"**Total de Registros:** {len(df):,}")
         
-        # Filters
-        st.markdown("#### Filtros")
+        # --- NEW MONTH FILTER ---
+        if 'Mês' in df.columns:
+            # Sort months naturally if they are numbers or text numbers
+            try:
+                unique_months = sorted(df['Mês'].unique(), key=lambda x: int(x) if str(x).isdigit() else x)
+            except:
+                unique_months = sorted(df['Mês'].astype(str).unique())
+                
+            selected_months = st.multiselect("📅 Filtrar por Mês(es)", options=unique_months, placeholder="Selecione um ou mais meses (deixe vazio para todos)")
+            
+            if selected_months:
+                df = df[df['Mês'].isin(selected_months)]
+                st.caption(f"Filtrado para meses: {', '.join(map(str, selected_months))}")
+
+        # --- EXISTING FILTERS (Campo / Poço) ---
         col1, col2 = st.columns(2)
-        
-        # Determine strict column names for filtering
-        # The cleaning step guarantees "Campo" and "Poço" if they were "[Campo]" and "[Poço]"
         
         filtered_df = df.copy()
         
         # Filter by Campo
         if "Campo" in filtered_df.columns:
-            campos = sorted(filtered_df["Campo"].dropna().astype(str).unique().tolist())
-            selected_campos = col1.multiselect("Filtrar por Campo", options=campos)
-            if selected_campos:
-                filtered_df = filtered_df[filtered_df["Campo"].isin(selected_campos)]
-        else:
-            col1.warning("Coluna 'Campo' não encontrada.")
-            
+            campos = sorted(filtered_df["Campo"].dropna().astype(str).unique())
+            sel_campos = col1.multiselect("Filtrar por Campo", campos)
+            if sel_campos:
+                filtered_df = filtered_df[filtered_df["Campo"].isin(sel_campos)]
+        
         # Filter by Poço
         if "Poço" in filtered_df.columns:
-            # Dependent on Campo selection? Usually yes, but here we just filter the current df
-            pocos = sorted(filtered_df["Poço"].dropna().astype(str).unique().tolist())
-            selected_pocos = col2.multiselect("Filtrar por Poço", options=pocos)
-            if selected_pocos:
-                filtered_df = filtered_df[filtered_df["Poço"].isin(selected_pocos)]
-        else:
-            col2.warning("Coluna 'Poço' não encontrada.")
+            # Update wells based on current filtered_df (which might be filtered by Campo)
+            pocos = sorted(filtered_df["Poço"].dropna().astype(str).unique())
+            sel_pocos = col2.multiselect("Filtrar por Poço", pocos)
+            if sel_pocos:
+                filtered_df = filtered_df[filtered_df["Poço"].isin(sel_pocos)]
         
-        # Show count
-        st.info(f"Exibindo {len(filtered_df)} registros.")
-
-        # Preview
         st.dataframe(filtered_df, use_container_width=True)
         
-        # Export
-        st.markdown("---")
+        # --- EXPORT ---
+        st.markdown("### Exportação")
         if not filtered_df.empty:
-            excel_data = to_excel(filtered_df)
+            excel_bytes = to_excel(filtered_df)
             st.download_button(
-                label="📥 Gerar Relatório Excel",
-                data=excel_data,
-                file_name=f"producao_anp_{st.session_state.get('year', 'dados')}.xlsx",
+                label="📥 Baixar Planilha Excel (.xlsx)",
+                data=excel_bytes,
+                file_name=f"Producao_ANP_{st.session_state['year']}_{st.session_state['env']}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
         else:
-            st.warning("Sem dados para exportar com os filtros atuais.")
-            
-    elif 'data' in st.session_state:
-        st.warning("O arquivo foi baixado mas parece estar vazio ou inválido.")
-    else:
-        st.info("Utilize o menu lateral para selecionar o ano e baixar os dados.")
+            st.warning("A tabela está vazia com os filtros atuais.")
 
 if __name__ == "__main__":
     main()
-
