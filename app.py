@@ -248,32 +248,46 @@ def main():
         annotated_years = get_available_years()
     
     if annotated_years:
-        # Year Selection
-        selected_year = st.sidebar.selectbox("1. Selecione o Ano", options=list(annotated_years.keys()))
+        # Year Selection (Multi-select)
+        available_years = list(annotated_years.keys())
+        selected_years = st.sidebar.multiselect(
+            "1. Selecione o(s) Ano(s)", 
+            options=available_years,
+            placeholder="Escolha um ou mais anos"
+        )
         
-        # Environment Selection (based on what's available for that year)
-        available_envs = annotated_years[selected_year] # e.g. {'Terra': url, 'Mar': url}
-        
-        # Sort keys for consistent order usually [Mar, Terra] or [Terra, Mar]
-        display_options = sorted(list(available_envs.keys()))
-            
-        selected_env = st.sidebar.radio("2. Selecione o Ambiente", display_options)
+        # Environment Selection
+        # Logic: Show envs available in ANY of the selected years? Or intersection?
+        # Simpler: Show Terra/Mar and warn if missing.
+        selected_env = st.sidebar.radio("2. Selecione o Ambiente", ["Terra", "Mar"])
         
         # Determine URLs to download
         urls_to_download = []
-        if selected_env in available_envs:
-            urls_to_download = [available_envs[selected_env]]
-            
-        st.sidebar.info(f"Arquivos identificados: {len(urls_to_download)}")
-
+        missing_years_for_env = []
+        
+        if selected_years:
+            for y in selected_years:
+                if y in annotated_years and selected_env in annotated_years[y]:
+                    urls_to_download.append(annotated_years[y][selected_env])
+                else:
+                    missing_years_for_env.append(y)
+        
+        if selected_years:
+            st.sidebar.info(f"Arquivos: {len(urls_to_download)} (de {len(selected_years)} anos)")
+            if missing_years_for_env:
+                st.sidebar.warning(f"Sem dados {selected_env}: {', '.join(missing_years_for_env)}")
+        
         # Download Button
         if st.sidebar.button("Baixar Dados"):
             if urls_to_download:
                 st.session_state['data'] = get_dataset(urls_to_download)
-                st.session_state['year'] = selected_year
+                st.session_state['year'] = ", ".join(sorted(selected_years))
                 st.session_state['env'] = selected_env
             else:
-                st.error("Erro ao identificar URLs de download.")
+                if not selected_years:
+                    st.error("Selecione pelo menos um ano.")
+                else:
+                    st.error("Nenhum arquivo encontrado para a seleção.")
 
     else:
         st.error("Não foi possível carregar a lista de anos do site da ANP.")
@@ -283,44 +297,62 @@ def main():
     if 'data' in st.session_state and not st.session_state['data'].empty:
         df = st.session_state['data']
         
+        st.sidebar.markdown("---")
+        st.sidebar.header("3. Filtros Globais")
+        
+        # 3.1 Sidebar Month Filter (Added as requested)
+        if 'Mês' in df.columns:
+            unique_months = sort_months(df['Mês'].unique())
+            sidebar_months = st.sidebar.multiselect(
+                "Filtrar Mês",
+                options=unique_months,
+                placeholder="Todos os meses"
+            )
+            if sidebar_months:
+                df = df[df['Mês'].isin(sidebar_months)]
+        
+        # 3.2 Sidebar Field Filter
+        if "Campo" in df.columns:
+            campos_sb = sorted(df["Campo"].dropna().astype(str).unique())
+            sel_campos_sb = st.sidebar.multiselect("Filtrar Campo", campos_sb)
+            if sel_campos_sb:
+                df = df[df["Campo"].isin(sel_campos_sb)]
+                
+        # 3.3 Sidebar Well Filter
+        if "Poço" in df.columns:
+            pocos_sb = sorted(df["Poço"].dropna().astype(str).unique())
+            sel_pocos_sb = st.sidebar.multiselect("Filtrar Poço", pocos_sb)
+            if sel_pocos_sb:
+                df = df[df["Poço"].isin(sel_pocos_sb)]
+
         st.divider()
         st.markdown(f"### 📊 Análise: {st.session_state['year']} - {st.session_state['env']}")
         st.write(f"**Total de Registros:** {len(df):,}")
         
-        # --- NEW MONTH FILTER ---
-        if 'Mês' in df.columns:
-            # Sort months naturally if they are numbers or text numbers
-            try:
-                unique_months = sorted(df['Mês'].unique(), key=lambda x: int(x) if str(x).isdigit() else x)
-            except:
-                unique_months = sorted(df['Mês'].astype(str).unique())
-                
-            selected_months = st.multiselect("📅 Filtrar por Mês(es)", options=unique_months, placeholder="Selecione um ou mais meses (deixe vazio para todos)")
-            
-            if selected_months:
-                df = df[df['Mês'].isin(selected_months)]
-                st.caption(f"Filtrado para meses: {', '.join(map(str, selected_months))}")
-
-        # --- EXISTING FILTERS (Campo / Poço) ---
-        col1, col2 = st.columns(2)
+        # --- MAIN VIEW FILTERS (Optional Refinement) ---
+        st.markdown("#### Filtros de Visualização")
+        col1, col2, col3 = st.columns(3)
         
         filtered_df = df.copy()
         
-        # Filter by Campo
+        # Month
+        if 'Mês' in filtered_df.columns:
+             uniq_m = sort_months(filtered_df['Mês'].unique())
+             sel_m = col1.multiselect("Mês", uniq_m)
+             if sel_m: filtered_df = filtered_df[filtered_df['Mês'].isin(sel_m)]
+             
+        # Campo
         if "Campo" in filtered_df.columns:
-            campos = sorted(filtered_df["Campo"].dropna().astype(str).unique())
-            sel_campos = col1.multiselect("Filtrar por Campo", campos)
-            if sel_campos:
-                filtered_df = filtered_df[filtered_df["Campo"].isin(sel_campos)]
-        
-        # Filter by Poço
+            c_view = sorted(filtered_df["Campo"].dropna().astype(str).unique())
+            sel_c = col2.multiselect("Campo", c_view)
+            if sel_c: filtered_df = filtered_df[filtered_df["Campo"].isin(sel_c)]
+            
+        # Poço
         if "Poço" in filtered_df.columns:
-            # Update wells based on current filtered_df (which might be filtered by Campo)
-            pocos = sorted(filtered_df["Poço"].dropna().astype(str).unique())
-            sel_pocos = col2.multiselect("Filtrar por Poço", pocos)
-            if sel_pocos:
-                filtered_df = filtered_df[filtered_df["Poço"].isin(sel_pocos)]
-        
+            p_view = sorted(filtered_df["Poço"].dropna().astype(str).unique())
+            sel_p = col3.multiselect("Poço", p_view)
+            if sel_p: filtered_df = filtered_df[filtered_df["Poço"].isin(sel_p)]
+            
         st.dataframe(filtered_df, use_container_width=True)
         
         # --- EXPORT ---
