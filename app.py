@@ -5,6 +5,7 @@ from bs4 import BeautifulSoup
 import io
 import re
 import numpy as np
+import xlsxwriter
 
 # --- CONFIG ---
 PAGE_TITLE = "ANP Produção de Petróleo e Gás"
@@ -80,11 +81,31 @@ def get_available_years():
         st.error(f"Erro ao buscar dados do site: {e}")
         return {}
 
+def sort_months(months):
+    """Ordena meses garantindo ordem numérica se possível."""
+    try:
+        return sorted(months, key=lambda x: int(x) if str(x).isdigit() else x)
+    except:
+        return sorted(months)
+
+
 def process_dataframe(df):
     """
     Cleans and processes the DataFrame.
     """
     
+    # --- CORREÇÃO: SEPARAR MÊS/ANO SE NECESSÁRIO ---
+    # Se tiver "Mês/Ano" (ex: 01/2025) mas não tiver "Mês" e "Ano" separados
+    if 'Mês/Ano' in df.columns and ('Mês' not in df.columns or 'Ano' not in df.columns):
+        try:
+            # Tenta separar pela barra
+            df[['Mês', 'Ano']] = df['Mês/Ano'].astype(str).str.split('/', expand=True)
+            # Converte para numérico para facilitar ordenação
+            df['Mês'] = pd.to_numeric(df['Mês'], errors='coerce')
+            df['Ano'] = pd.to_numeric(df['Ano'], errors='coerce')
+        except Exception:
+            pass
+
     # Columns to convert
     cols_to_convert = [
         "Produção de Óleo (m³)", 
@@ -109,14 +130,10 @@ def process_dataframe(df):
             except Exception:
                 pass
     
-    # Remove unwanted columns - KEEP 'Ambiente' now to distinguish Land/Sea
+    # Remove unwanted columns
     cols_to_drop = [
-        "Bacia", 
-        "Instalação", 
-        "Estado", 
-        # "Ambiente",  <-- REMOVED from drop list to keep it
-        "Produção de Condensado (m³)", 
-        "Injeção de Polímeros (m³)", 
+        "Bacia", "Instalação", "Estado", 
+        "Produção de Condensado (m³)", "Injeção de Polímeros (m³)", 
         "Injeção de Outros Fluidos (m³)"
     ]
     df = df.drop(columns=[c for c in cols_to_drop if c in df.columns], errors='ignore')
@@ -125,45 +142,34 @@ def process_dataframe(df):
     
     # A. PREPARAÇÃO DA DATA
     if 'Ano' in df.columns and 'Mês' in df.columns:
-        # Mapeamento de meses se estiverem em texto, mas geralmente no CSV ANP 'Mês' é numérico ou texto simples.
-        # Converter para garantir.
-        # Se for string numeral "01", "1", ok. Se for "Janeiro", precisaria de map. 
-        # Assumindo numerico conforme padrão observado, mas forçando string para criar data.
-        
         df['Data_Temp'] = pd.to_datetime(df['Ano'].astype(str) + '-' + df['Mês'].astype(str) + '-01', errors='coerce')
-        
-        # Ordena por Poço e Data
         df = df.sort_values(by=['Poço', 'Data_Temp'])
         
-        # C. TEMPO (Dias desde o primeiro registro do poço)
+        # C. TEMPO
         df['tempo'] = df.groupby('Poço')['Data_Temp'].transform(lambda x: (x - x.min()).dt.days)
         
-        # E. Np (Produção Acumulada de Óleo por Poço)
-        # Converter m3 para bbl? O pedido original não especificou, manteve a unidade da coluna base (m3).
+        # E. Np
         df['Np'] = df.groupby('Poço')['Produção de Óleo (m³)'].cumsum()
         
-        # Manter Data_Temp para filtros de data se necessário, ou remover.
-        # Como pedido "Filtro de Mês", é bom ter Mês limpo, mas a coluna Mês original é usada.
-        # df = df.drop(columns=['Data_Temp']) 
+        # Remove Data_Temp para não poluir, se quiser
+        df = df.drop(columns=['Data_Temp']) 
     else:
         df['tempo'] = 0
         df['Np'] = 0
 
-    # B. RGO (Razão Gás-Óleo)
-    # Gás Total (Mm³ * 1000 = m³) / Óleo (m³)
-    gas_total_m3 = (df["Produção de Gás Associado (Mm³)"] + df["Produção de Gás Não Associado (Mm³)"]) * 1000
+    # B. RGO
+    gas_total_m3 = (df.get("Produção de Gás Associado (Mm³)", 0) + df.get("Produção de Gás Não Associado (Mm³)", 0)) * 1000
     
-    # Evitar divisão por zero e NaNs
     df['RGO'] = np.where(df['Produção de Óleo (m³)'] > 0, 
                          gas_total_m3 / df['Produção de Óleo (m³)'], 
                          0)
 
-    # RAO (Razão Água-Óleo)
+    # RAO
     df['RAO'] = np.where(df['Produção de Óleo (m³)'] > 0, 
-                         df['Produção de Água (m³)'] / df['Produção de Óleo (m³)'], 
+                         df.get('Produção de Água (m³)', 0) / df['Produção de Óleo (m³)'], 
                          0)
 
-    # D. lnq (Logaritmo Natural da Vazão de Óleo)
+    # D. lnq
     df['lnq'] = np.nan
     mask_oleo_positivo = df['Produção de Óleo (m³)'] > 0
     df.loc[mask_oleo_positivo, 'lnq'] = np.log(df.loc[mask_oleo_positivo, 'Produção de Óleo (m³)'])
@@ -329,28 +335,22 @@ def main():
         st.markdown(f"### 📊 Análise: {st.session_state['year']} - {st.session_state['env']}")
         st.write(f"**Total de Registros:** {len(df):,}")
         
-        # --- MAIN VIEW FILTERS (Optional Refinement) ---
+        # --- MAIN VIEW FILTERS (Optional Refinement - Field/Well Only) ---
         st.markdown("#### Filtros de Visualização")
-        col1, col2, col3 = st.columns(3)
+        col1, col2 = st.columns(2)
         
         filtered_df = df.copy()
         
-        # Month
-        if 'Mês' in filtered_df.columns:
-             uniq_m = sort_months(filtered_df['Mês'].unique())
-             sel_m = col1.multiselect("Mês", uniq_m)
-             if sel_m: filtered_df = filtered_df[filtered_df['Mês'].isin(sel_m)]
-             
         # Campo
         if "Campo" in filtered_df.columns:
             c_view = sorted(filtered_df["Campo"].dropna().astype(str).unique())
-            sel_c = col2.multiselect("Campo", c_view)
+            sel_c = col1.multiselect("Campo", c_view)
             if sel_c: filtered_df = filtered_df[filtered_df["Campo"].isin(sel_c)]
             
         # Poço
         if "Poço" in filtered_df.columns:
             p_view = sorted(filtered_df["Poço"].dropna().astype(str).unique())
-            sel_p = col3.multiselect("Poço", p_view)
+            sel_p = col2.multiselect("Poço", p_view)
             if sel_p: filtered_df = filtered_df[filtered_df["Poço"].isin(sel_p)]
             
         st.dataframe(filtered_df, use_container_width=True)
