@@ -73,7 +73,12 @@ def get_available_years():
                 if env:
                     if year_key not in years_data:
                         years_data[year_key] = {}
-                    years_data[year_key][env] = href
+                    
+                    if env not in years_data[year_key]:
+                        years_data[year_key][env] = []
+                    
+                    if href not in years_data[year_key][env]:
+                        years_data[year_key][env].append(href)
 
         return dict(sorted(years_data.items(), key=lambda item: item[0], reverse=True))
 
@@ -274,7 +279,7 @@ def main():
         if selected_years:
             for y in selected_years:
                 if y in annotated_years and selected_env in annotated_years[y]:
-                    urls_to_download.append(annotated_years[y][selected_env])
+                    urls_to_download.extend(annotated_years[y][selected_env])
                 else:
                     missing_years_for_env.append(y)
         
@@ -306,16 +311,49 @@ def main():
         st.sidebar.markdown("---")
         st.sidebar.header("3. Filtros Globais")
         
-        # 3.1 Sidebar Month Filter (Added as requested)
-        if 'Mês' in df.columns:
-            unique_months = sort_months(df['Mês'].unique())
+        # 3.1 Sidebar Month Filter
+        # Identify Month Column (Mês or Mes)
+        month_col = None
+        for col in ['Mês', 'Mes', 'Month']:
+            if col in df.columns:
+                month_col = col
+                break
+        
+        if month_col:
+            # Map for display 1 -> Janeiro
+            month_map = {
+                1: "Janeiro", 2: "Fevereiro", 3: "Março", 4: "Abril", 5: "Maio", 6: "Junho",
+                7: "Julho", 8: "Agosto", 9: "Setembro", 10: "Outubro", 11: "Novembro", 12: "Dezembro"
+            }
+            
+            # User wants ALL months available (1-12), not just what's in DF
+            all_months = list(range(1, 13))
+
+            # Helper to format
+            def format_month(m):
+                return f"{month_map.get(m, m)} ({m})"
+
             sidebar_months = st.sidebar.multiselect(
                 "Filtrar Mês",
-                options=unique_months,
-                placeholder="Todos os meses"
+                options=all_months,
+                format_func=format_month,
+                placeholder="Selecione os meses"
             )
+            
             if sidebar_months:
-                df = df[df['Mês'].isin(sidebar_months)]
+                # Ensure column is numeric for comparison
+                # Try to convert column to numeric if it isn't already, for reliable filtering
+                try:
+                    # Create a temporary mask without modifying original df inplace immediately if possible
+                    # But keeping simple: force numeric conversion for the filter column
+                    # If it fails (non-numeric data), we might miss rows, but ANP data usually is clean or cleaned
+                    is_numeric = pd.to_numeric(df[month_col], errors='coerce')
+                    mask = is_numeric.isin(sidebar_months)
+                    df = df[mask]
+                except Exception:
+                    # Fallback: compare as strings if numeric conversion fails completely
+                    sidebar_months_str = [str(m) for m in sidebar_months]
+                    df = df[df[month_col].astype(str).isin(sidebar_months_str)]
         
         # 3.2 Sidebar Field Filter
         if "Campo" in df.columns:
