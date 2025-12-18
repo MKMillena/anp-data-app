@@ -373,30 +373,15 @@ def main():
         st.markdown(f"### 📊 Análise: {st.session_state['year']} - {st.session_state['env']}")
         st.write(f"**Total de Registros:** {len(df):,}")
         
-        # --- MAIN VIEW FILTERS (Optional Refinement - Field/Well Only) ---
-        st.markdown("#### Filtros de Visualização")
-        col1, col2 = st.columns(2)
+        # --- MAIN VIEW ---
+        # Filters are now exclusively in the sidebar as requested
         
-        filtered_df = df.copy()
-        
-        # Campo
-        if "Campo" in filtered_df.columns:
-            c_view = sorted(filtered_df["Campo"].dropna().astype(str).unique())
-            sel_c = col1.multiselect("Campo", c_view)
-            if sel_c: filtered_df = filtered_df[filtered_df["Campo"].isin(sel_c)]
-            
-        # Poço
-        if "Poço" in filtered_df.columns:
-            p_view = sorted(filtered_df["Poço"].dropna().astype(str).unique())
-            sel_p = col2.multiselect("Poço", p_view)
-            if sel_p: filtered_df = filtered_df[filtered_df["Poço"].isin(sel_p)]
-            
-        st.dataframe(filtered_df, use_container_width=True)
+        st.dataframe(df, use_container_width=True)
         
         # --- EXPORT ---
         st.markdown("### Exportação")
-        if not filtered_df.empty:
-            excel_bytes = to_excel(filtered_df)
+        if not df.empty:
+            excel_bytes = to_excel(df)
             st.download_button(
                 label="📥 Baixar Planilha Excel (.xlsx)",
                 data=excel_bytes,
