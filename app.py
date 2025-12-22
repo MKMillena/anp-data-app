@@ -6,6 +6,7 @@ import io
 import re
 import numpy as np
 import xlsxwriter
+import os
 
 # --- CONFIG ---
 PAGE_TITLE = "ANP Produção de Petróleo e Gás"
@@ -246,150 +247,168 @@ def to_excel(df):
         worksheet.set_column(0, max_col - 1, 15)
     return output.getvalue()
 
+def manage_local_database(force_update=False):
+    """
+    Gerencia o banco de dados local.
+    Se o arquivo existir, carrega. Se não (ou se forçar atualização), baixa tudo da ANP.
+    """
+    FILE_NAME = "dados_anp_completo.parquet"
+    
+    if os.path.exists(FILE_NAME) and not force_update:
+        try:
+            return pd.read_parquet(FILE_NAME)
+        except Exception:
+            st.warning("Arquivo local corrompido. Baixando novamente...")
+    
+    # Se chegou aqui, precisa baixar
+    st.info("Iniciando download completo da base de dados da ANP. Isso pode demorar alguns minutos...")
+    
+    years_data = get_available_years()
+    if not years_data:
+        return pd.DataFrame()
+    
+    # Coletar todas as URLs separadas por ambiente
+    urls_terra = []
+    urls_mar = []
+    
+    for year, envs in years_data.items():
+        if 'Terra' in envs:
+            urls_terra.extend(envs['Terra'])
+        if 'Mar' in envs:
+            urls_mar.extend(envs['Mar'])
+            
+    # Baixar e processar
+    df_terra = pd.DataFrame()
+    df_mar = pd.DataFrame()
+    
+    if urls_terra:
+        st.write(f"Baixando {len(urls_terra)} arquivos de Terra...")
+        df_terra = get_dataset(urls_terra)
+        if not df_terra.empty:
+            df_terra['Ambiente'] = 'Terra'
+            
+    if urls_mar:
+        st.write(f"Baixando {len(urls_mar)} arquivos de Mar...")
+        df_mar = get_dataset(urls_mar)
+        if not df_mar.empty:
+            df_mar['Ambiente'] = 'Mar'
+    
+    # Juntar tudo
+    full_df = pd.concat([df_terra, df_mar], ignore_index=True)
+    
+    # Salvar localmente para a próxima vez ser rápida
+    if not full_df.empty:
+        # Converter colunas object para string para compatibilidade com parquet
+        full_df.columns = full_df.columns.astype(str)
+        full_df.to_parquet(FILE_NAME, index=False)
+        st.success("Base de dados atualizada e salva localmente!")
+        
+    return full_df
+
 # --- MAIN APP ---
 
 def main():
     st.set_page_config(page_title=PAGE_TITLE, layout="wide")
     st.title(PAGE_TITLE)
-    
-    st.sidebar.header("Configurações")
-    
-    # 1. Scraping Years
-    with st.spinner("Conectando ao site da ANP..."):
-        annotated_years = get_available_years()
-    
-    if annotated_years:
-        # Year Selection (Multi-select)
-        available_years = list(annotated_years.keys())
-        selected_years = st.sidebar.multiselect(
-            "1. Selecione o(s) Ano(s)", 
-            options=available_years,
-            placeholder="Escolha um ou mais anos"
-        )
-        
-        # Environment Selection
-        # Logic: Show envs available in ANY of the selected years? Or intersection?
-        # Simpler: Show Terra/Mar and warn if missing.
-        selected_env = st.sidebar.radio("2. Selecione o Ambiente", ["Terra", "Mar"])
-        
-        # Determine URLs to download
-        urls_to_download = []
-        missing_years_for_env = []
-        
-        if selected_years:
-            for y in selected_years:
-                if y in annotated_years and selected_env in annotated_years[y]:
-                    urls_to_download.extend(annotated_years[y][selected_env])
-                else:
-                    missing_years_for_env.append(y)
-        
-        if selected_years:
-            st.sidebar.info(f"Arquivos: {len(urls_to_download)} (de {len(selected_years)} anos)")
-            if missing_years_for_env:
-                st.sidebar.warning(f"Sem dados {selected_env}: {', '.join(missing_years_for_env)}")
-        
-        # Download Button
-        if st.sidebar.button("Baixar Dados"):
-            if urls_to_download:
-                st.session_state['data'] = get_dataset(urls_to_download)
-                st.session_state['year'] = ", ".join(sorted(selected_years))
-                st.session_state['env'] = selected_env
-            else:
-                if not selected_years:
-                    st.error("Selecione pelo menos um ano.")
-                else:
-                    st.error("Nenhum arquivo encontrado para a seleção.")
 
-    else:
-        st.error("Não foi possível carregar a lista de anos do site da ANP.")
-        st.warning("Verifique sua conexão ou se o site da ANP mudou de estrutura.")
+    # --- BARRA LATERAL ---
+    st.sidebar.header("1. Configurações")
+    
+    # Botão para forçar atualização (caso saiam dados novos na ANP)
+    if st.sidebar.button("🔄 Atualizar Base de Dados (Download)"):
+        st.session_state['data'] = manage_local_database(force_update=True)
+    
+    # Carregamento Inicial (Automático ou via Cache)
+    if 'data' not in st.session_state:
+        with st.spinner("Carregando base de dados local..."):
+            st.session_state['data'] = manage_local_database(force_update=False)
 
-    # 3. Data View
-    if 'data' in st.session_state and not st.session_state['data'].empty:
-        df = st.session_state['data']
+    df = st.session_state.get('data', pd.DataFrame())
+
+    if not df.empty:
+        # --- FILTROS DA BARRA LATERAL (Obrigatórios) ---
+        
+        # 1. Escolha Terra ou Mar
+        # Verifica se a coluna Ambiente existe (criada na nossa nova função)
+        if 'Ambiente' in df.columns:
+            ambientes = sorted(df['Ambiente'].unique())
+            selected_env = st.sidebar.radio("Ambiente", ambientes)
+            # Filtra o DF globalmente pelo ambiente
+            df = df[df['Ambiente'] == selected_env]
         
         st.sidebar.markdown("---")
-        st.sidebar.header("3. Filtros Globais")
         
-        # 3.1 Sidebar Month Filter
-        # Identify Month Column (Mês or Mes)
-        month_col = None
-        for col in ['Mês', 'Mes', 'Month']:
-            if col in df.columns:
-                month_col = col
-                break
-        
-        if month_col:
-            # Map for display 1 -> Janeiro
-            month_map = {
-                1: "Janeiro", 2: "Fevereiro", 3: "Março", 4: "Abril", 5: "Maio", 6: "Junho",
-                7: "Julho", 8: "Agosto", 9: "Setembro", 10: "Outubro", 11: "Novembro", 12: "Dezembro"
-            }
-            
-            # User wants ALL months available (1-12), not just what's in DF
-            all_months = list(range(1, 13))
-
-            # Helper to format
-            def format_month(m):
-                return f"{month_map.get(m, m)} ({m})"
-
-            sidebar_months = st.sidebar.multiselect(
-                "Filtrar Mês",
-                options=all_months,
-                format_func=format_month,
-                placeholder="Selecione os meses"
+        # 2. Escolha o Campo (Agora já temos todos os campos do ambiente carregados)
+        if "Campo" in df.columns:
+            campos_disponiveis = sorted(df["Campo"].dropna().astype(str).unique())
+            sel_campos = st.sidebar.multiselect(
+                "Selecione o Campo", 
+                options=campos_disponiveis,
+                placeholder="Escolha um ou mais campos"
             )
             
-            if sidebar_months:
-                # Ensure column is numeric for comparison
-                # Try to convert column to numeric if it isn't already, for reliable filtering
-                try:
-                    # Create a temporary mask without modifying original df inplace immediately if possible
-                    # But keeping simple: force numeric conversion for the filter column
-                    # If it fails (non-numeric data), we might miss rows, but ANP data usually is clean or cleaned
-                    is_numeric = pd.to_numeric(df[month_col], errors='coerce')
-                    mask = is_numeric.isin(sidebar_months)
-                    df = df[mask]
-                except Exception:
-                    # Fallback: compare as strings if numeric conversion fails completely
-                    sidebar_months_str = [str(m) for m in sidebar_months]
-                    df = df[df[month_col].astype(str).isin(sidebar_months_str)]
+            if sel_campos:
+                df = df[df["Campo"].isin(sel_campos)]
+            else:
+                # Opcional: Se não escolher campo, mostra aviso ou mostra tudo?
+                # Geralmente é bom pedir para selecionar para não travar o navegador com muitos dados
+                st.info("👈 Selecione um ou mais Campos na barra lateral para visualizar os dados.")
+                st.stop() # Para a execução aqui até selecionar um campo
+
+        # --- ÁREA PRINCIPAL (Filtros de Data e Poço) ---
         
-        # 3.2 Sidebar Field Filter
-        if "Campo" in df.columns:
-            campos_sb = sorted(df["Campo"].dropna().astype(str).unique())
-            sel_campos_sb = st.sidebar.multiselect("Filtrar Campo", campos_sb)
-            if sel_campos_sb:
-                df = df[df["Campo"].isin(sel_campos_sb)]
-                
-        # 3.3 Sidebar Well Filter
-        if "Poço" in df.columns:
-            pocos_sb = sorted(df["Poço"].dropna().astype(str).unique())
-            sel_pocos_sb = st.sidebar.multiselect("Filtrar Poço", pocos_sb)
-            if sel_pocos_sb:
-                df = df[df["Poço"].isin(sel_pocos_sb)]
+        st.markdown("### 🔍 Filtros de Período e Poço")
+        col1, col2, col3 = st.columns(3)
+        
+        # Filtro de Ano
+        with col1:
+            if "Ano" in df.columns:
+                anos_disp = sorted(df["Ano"].unique(), reverse=True)
+                sel_anos = st.multiselect("Ano", anos_disp)
+                if sel_anos:
+                    df = df[df["Ano"].isin(sel_anos)]
+        
+        # Filtro de Mês
+        with col2:
+            month_col = next((c for c in ['Mês', 'Mes', 'Month'] if c in df.columns), None)
+            if month_col:
+                meses = df[month_col].dropna().unique()
+                try:
+                    meses = sorted(meses, key=lambda x: int(x))
+                except:
+                    meses = sorted(meses)
+                sel_meses = st.multiselect("Mês", meses)
+                if sel_meses:
+                    df = df[df[month_col].isin(sel_meses)]
+                    
+        # Filtro de Poço
+        with col3:
+            if "Poço" in df.columns:
+                pocos = sorted(df["Poço"].dropna().astype(str).unique())
+                sel_pocos = st.multiselect("Poço", pocos)
+                if sel_pocos:
+                    df = df[df["Poço"].isin(sel_pocos)]
 
         st.divider()
-        st.markdown(f"### 📊 Análise: {st.session_state['year']} - {st.session_state['env']}")
-        st.write(f"**Total de Registros:** {len(df):,}")
         
-        # --- MAIN VIEW ---
-        # Filters are now exclusively in the sidebar as requested
+        # --- RESULTADOS ---
+        st.markdown(f"### 📊 Dados Filtrados")
+        st.write(f"**Registros:** {len(df):,}")
         
         st.dataframe(df, use_container_width=True)
         
-        # --- EXPORT ---
-        st.markdown("### Exportação")
         if not df.empty:
             excel_bytes = to_excel(df)
             st.download_button(
-                label="📥 Baixar Planilha Excel (.xlsx)",
+                label="📥 Baixar Excel",
                 data=excel_bytes,
-                file_name=f"Producao_ANP_{st.session_state['year']}_{st.session_state['env']}.xlsx",
+                file_name="Producao_ANP_Filtrada.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
-        else:
-            st.warning("A tabela está vazia com os filtros atuais.")
+
+    else:
+        st.warning("A base de dados está vazia. Tente clicar em 'Atualizar Base de Dados'.")
 
 if __name__ == "__main__":
     main()
+
