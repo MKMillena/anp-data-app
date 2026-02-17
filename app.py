@@ -15,6 +15,7 @@ import glob
 PAGE_TITLE = "ANP Produção de Petróleo e Gás"
 DATA_URL = "https://www.gov.br/anp/pt-br/centrais-de-conteudo/dados-abertos/fase-de-desenvolvimento-e-producao"
 DOWNLOAD_DIR = "anp_data"
+CACHE_DIR = "anp_cache"
 METADATA_DIR = "anp_metadata"
 
 # --- HELPER FUNCTIONS ---
@@ -24,6 +25,8 @@ def ensure_dirs():
         os.makedirs(DOWNLOAD_DIR)
     if not os.path.exists(METADATA_DIR):
         os.makedirs(METADATA_DIR)
+    if not os.path.exists(CACHE_DIR):
+        os.makedirs(CACHE_DIR)
 
 def get_metadata_path(env):
     return os.path.join(METADATA_DIR, f"campos_{env}.json")
@@ -200,80 +203,134 @@ def update_metadata_cache(target_env, full_scan=False):
     save_metadata(target_env, unique_campos)
     return sorted(list(unique_campos))
 
+def update_and_load_cache(target_env, files_to_process):
+    """
+    1. Iterates over files.
+    2. Checks if we have a valid cache (.pkl) for each.
+    3. If not, reads CSV, Cleans, and saves .pkl.
+    4. Returns list of DataFrames (from cache).
+    """
+    ensure_dirs()
+    cached_dfs = []
+    
+    # Progress only if we actually need to process things
+    bar = st.progress(0, text="Verificando cache...")
+    total = len(files_to_process)
+    
+    for i, (year, filename, url) in enumerate(files_to_process):
+        csv_path = os.path.join(DOWNLOAD_DIR, f"{year}_{target_env}_{filename}")
+        cache_filename = f"{year}_{target_env}_{filename}.pkl"
+        cache_path = os.path.join(CACHE_DIR, cache_filename)
+        
+        # Check if we need to update cache
+        # Logic: Update if Cache missing OR CSV is newer than Cache
+        needs_update = True
+        if os.path.exists(cache_path) and os.path.exists(csv_path):
+             csv_mtime = os.path.getmtime(csv_path)
+             cache_mtime = os.path.getmtime(cache_path)
+             if cache_mtime > csv_mtime:
+                 needs_update = False
+        
+        if needs_update:
+            bar.progress(i / total, text=f"Processando e Salvando: {year}...")
+            # Read CSV
+            try:
+                try:
+                    df_temp = pd.read_csv(csv_path, sep=',', encoding='windows-1252', on_bad_lines='skip')
+                except UnicodeDecodeError:
+                    df_temp = pd.read_csv(csv_path, sep=',', encoding='utf-8', on_bad_lines='skip')
+                
+                df_temp.columns = df_temp.columns.str.replace(r'[\[\]]', '', regex=True).str.strip()
+                
+                # Clean (Chunk level)
+                df_clean = clean_dataframe_chunk(df_temp)
+                
+                # Save Cache
+                if not df_clean.empty:
+                    df_clean.to_pickle(cache_path)
+                    cached_dfs.append(df_clean)
+            except Exception as e:
+                # print(f"Error processing {csv_path}: {e}")
+                pass
+        else:
+            # Load from Cache
+             bar.progress(i / total, text=f"Carregando do Cache: {year}...")
+             try:
+                 df_cached = pd.read_pickle(cache_path)
+                 cached_dfs.append(df_cached)
+             except:
+                 pass # If load fails, ignore
+
+    bar.empty()
+    return cached_dfs
+
 def load_data_for_fields(target_env, selected_campos=None):
     """
-    Ensures ALL files are present (downloads if missing) and loads data.
-    Filters by selected_campos during load.
+    Orchestrates: Download -> Update Cache -> Load Cached -> Concat -> Calc Metrics -> Filter
     """
     ensure_dirs()
     
-    # 1. Identify all needed files
+    # 1. Map Files
     files_to_process = get_available_files(target_env)
-    total = len(files_to_process)
-    
-    if total == 0:
+    if not files_to_process:
         return pd.DataFrame()
 
-    dfs = []
-    progress_bar = st.progress(0, text="Preparando download dos dados...")
-    
+    # 2. Ensure Downloads (Quick check)
+    # We do a quick pass to ensure CSVs are on disk before caching
+    # (Previously this was mixed, now we separate download from processing)
+    total = len(files_to_process)
+    pbar = st.progress(0, text="Sincronizando arquivos...")
     for i, (year, filename, url) in enumerate(files_to_process):
         local_filename = f"{year}_{target_env}_{filename}"
         local_path = os.path.join(DOWNLOAD_DIR, local_filename)
         
-        # 2. DOWNLOAD (Deferred)
         if not os.path.exists(local_path):
-            progress_bar.progress(i / total, text=f"Baixando histórico: {year}...")
-            success = download_file(url, local_path)
-            if not success:
-                continue
-        else:
-             if i % 5 == 0:
-                progress_bar.progress(i / total, text=f"Lendo arquivo local: {year}...")
+            pbar.progress(i/total, text=f"Baixando: {year}...")
+            download_file(url, local_path)
+    pbar.empty()
 
-        # 3. LOAD & FILTER
-        try:
-            try:
-                 df_temp = pd.read_csv(local_path, sep=',', encoding='windows-1252', on_bad_lines='skip')
-            except UnicodeDecodeError:
-                 df_temp = pd.read_csv(local_path, sep=',', encoding='utf-8', on_bad_lines='skip')
-            
-            df_temp.columns = df_temp.columns.str.replace(r'[\[\]]', '', regex=True).str.strip()
-            
-            # FILTER ASAP
-            if selected_campos and 'Campo' in df_temp.columns:
-                # Ensure clean comparison
-                df_temp['Campo'] = df_temp['Campo'].astype(str).str.strip()
-                df_temp = df_temp[df_temp['Campo'].isin(selected_campos)]
-            
-            if not df_temp.empty:
-                dfs.append(df_temp)
-        except Exception:
-            pass
-            
-    progress_bar.empty()
+    # 3. Update & Load Cache
+    dfs = update_and_load_cache(target_env, files_to_process)
     
     if not dfs:
         return pd.DataFrame()
     
+    # 4. Concat
     full_df = pd.concat(dfs, ignore_index=True)
-    return process_dataframe(full_df)
+    
+    # 5. Global Calculations
+    full_df = calculate_metrics_global(full_df)
+    
+    # 6. Apply Field Filter (LAST STEP)
+    # This allows the cache to store ALL fields, so switching is fast.
+    if selected_campos:
+        # Normalize for matching
+        if 'Campo' in full_df.columns:
+             full_df['Campo_Clean'] = full_df['Campo'].astype(str).str.strip()
+             full_df = full_df[full_df['Campo_Clean'].isin(selected_campos)]
+             full_df = full_df.drop(columns=['Campo_Clean'])
+    
+    return full_df
 
-def process_dataframe(df):
+def clean_dataframe_chunk(df):
     """
-    Cleans and processes the DataFrame.
+    Step 1: Clean types and basic columns. Safe to do per-file.
+    Does NOT do cumulative calculations.
     """
     
-    # --- CORREÇÃO: SEPARAR MÊS/ANO SE NECESSÁRIO ---
+    # --- DATE CLEANING (Fix format to standard integers) ---
     if 'Mês/Ano' in df.columns and ('Mês' not in df.columns or 'Ano' not in df.columns):
         try:
             df[['Mês', 'Ano']] = df['Mês/Ano'].astype(str).str.split('/', expand=True)
-            df['Mês'] = pd.to_numeric(df['Mês'], errors='coerce')
-            df['Ano'] = pd.to_numeric(df['Ano'], errors='coerce')
-        except Exception:
+        except:
             pass
+            
+    if 'Ano' in df.columns:
+         df['Ano'] = pd.to_numeric(df['Ano'], errors='coerce').fillna(0).astype(int)
+    if 'Mês' in df.columns:
+         df['Mês'] = pd.to_numeric(df['Mês'], errors='coerce').fillna(0).astype(int)
 
-    # Columns to convert
+    # --- NUMERIC CLEANING ---
     cols_to_convert = [
         "Produção de Óleo (m³)", 
         "Produção de Gás Associado (Mm³)", 
@@ -292,12 +349,13 @@ def process_dataframe(df):
     for col in valid_cols:
         if not pd.api.types.is_numeric_dtype(df[col]):
             try:
+                # Remove thousands separator (.), replace decimal (,) -> float
                 df[col] = df[col].astype(str).str.replace('.', '', regex=False).str.replace(',', '.', regex=False)
                 df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
             except Exception:
                 pass
     
-    # Remove unwanted columns
+    # Drop unwanted
     cols_to_drop = [
         "Bacia", "Instalação", "Estado", 
         "Produção de Condensado (m³)", "Injeção de Polímeros (m³)", 
@@ -305,15 +363,15 @@ def process_dataframe(df):
     ]
     df = df.drop(columns=[c for c in cols_to_drop if c in df.columns], errors='ignore')
     
-    # --- CÁLCULOS DE ENGENHARIA ---
-    if 'Ano' in df.columns and 'Mês' in df.columns:
-        # Pre-process Year/Month to ensure they are clean integers
-        try:
-             df['Ano'] = pd.to_numeric(df['Ano'], errors='coerce').fillna(0).astype(int)
-             df['Mês'] = pd.to_numeric(df['Mês'], errors='coerce').fillna(0).astype(int)
-        except:
-             pass
+    return df
 
+def calculate_metrics_global(df):
+    """
+    Step 2: Cumulative metrics and Filtering that requires full context.
+    """
+    
+    # --- DATE ENGINE & FILTER ---
+    if 'Ano' in df.columns and 'Mês' in df.columns:
         df['Data_Temp'] = pd.to_datetime(
             df['Ano'].astype(str) + '-' + df['Mês'].astype(str) + '-01', 
             errors='coerce'
@@ -324,14 +382,16 @@ def process_dataframe(df):
         hoje = datetime.now()
         data_limite = hoje.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
         
-        # Debug/Feedback (Optional - can be removed if too verbose, but useful here)
-        # st.write(f"Ref Date: {data_limite}")
-        
         df = df[df['Data_Temp'] < data_limite]
         
+        # Sort for Cumulative calcs
         df = df.sort_values(by=['Poço', 'Data_Temp'])
+        
+        # Metrics
         df['tempo'] = df.groupby('Poço')['Data_Temp'].transform(lambda x: (x - x.min()).dt.days)
         df['Np'] = df.groupby('Poço')['Produção de Óleo (m³)'].cumsum()
+        
+        # Drop temp date if not needed, creates cleaner output
         df = df.drop(columns=['Data_Temp']) 
     else:
         df['tempo'] = 0
