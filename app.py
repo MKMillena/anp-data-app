@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import requests
+from datetime import datetime
 from bs4 import BeautifulSoup
 import io
 import re
@@ -241,6 +242,8 @@ def load_data_for_fields(target_env, selected_campos=None):
             
             # FILTER ASAP
             if selected_campos and 'Campo' in df_temp.columns:
+                # Ensure clean comparison
+                df_temp['Campo'] = df_temp['Campo'].astype(str).str.strip()
                 df_temp = df_temp[df_temp['Campo'].isin(selected_campos)]
             
             if not df_temp.empty:
@@ -304,7 +307,28 @@ def process_dataframe(df):
     
     # --- CÁLCULOS DE ENGENHARIA ---
     if 'Ano' in df.columns and 'Mês' in df.columns:
-        df['Data_Temp'] = pd.to_datetime(df['Ano'].astype(str) + '-' + df['Mês'].astype(str) + '-01', errors='coerce')
+        # Pre-process Year/Month to ensure they are clean integers
+        try:
+             df['Ano'] = pd.to_numeric(df['Ano'], errors='coerce').fillna(0).astype(int)
+             df['Mês'] = pd.to_numeric(df['Mês'], errors='coerce').fillna(0).astype(int)
+        except:
+             pass
+
+        df['Data_Temp'] = pd.to_datetime(
+            df['Ano'].astype(str) + '-' + df['Mês'].astype(str) + '-01', 
+            errors='coerce'
+        )
+        
+        # FILTRO: Remove dados do mês/ano atual (ou futuro)
+        # Mantém apenas registros ANTERIORES ao dia 1 do mês atual
+        hoje = datetime.now()
+        data_limite = hoje.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        
+        # Debug/Feedback (Optional - can be removed if too verbose, but useful here)
+        # st.write(f"Ref Date: {data_limite}")
+        
+        df = df[df['Data_Temp'] < data_limite]
+        
         df = df.sort_values(by=['Poço', 'Data_Temp'])
         df['tempo'] = df.groupby('Poço')['Data_Temp'].transform(lambda x: (x - x.min()).dt.days)
         df['Np'] = df.groupby('Poço')['Produção de Óleo (m³)'].cumsum()
@@ -382,75 +406,81 @@ def main():
                 st.session_state['campos_selecionados'] = sel_campos
 
     # 3. FIELD SELECTION & FILTERS (Only if data is loaded)
-    if 'data' in st.session_state and not st.session_state['data'].empty:
+    if 'data' in st.session_state:
+        # Even if empty, we want to show feedback IF the user just tried to load
         df = st.session_state['data']
         
-        # Check consistency
-        if st.session_state.get('env') != selected_env:
-            st.warning("Ambiente alterado. Por favor, carregue os dados novamente.")
-        else:
-            st.sidebar.markdown("---")
-            st.sidebar.header("3. Filtros Adicionais")
-            
-            # --- OTHER FILTERS (Year, Month, Well) ---
-            
-            # Year Filter
-            if "Ano" in df.columns:
-                unique_years = sorted(df["Ano"].dropna().unique(), reverse=True)
-                sel_years = st.sidebar.multiselect("Filtrar Ano", unique_years)
-                if sel_years:
-                     df = df[df["Ano"].isin(sel_years)]
+        if df.empty and st.session_state.get('campos_selecionados'):
+             st.warning(f"⚠️ Nenhum dado encontrado para os campos: {', '.join(st.session_state['campos_selecionados'])} após aplicar os filtros de data.")
+             st.caption("Verifique se os campos possuem dados históricos (anteriores ao mês atual).")
+        
+        elif not df.empty:
+            # Check consistency
+            if st.session_state.get('env') != selected_env:
+                st.warning("Ambiente alterado. Por favor, carregue os dados novamente.")
+            else:
+                st.sidebar.markdown("---")
+                st.sidebar.header("3. Filtros Adicionais")
+                
+                # --- OTHER FILTERS (Year, Month, Well) ---
+                
+                # Year Filter
+                if "Ano" in df.columns:
+                    unique_years = sorted(df["Ano"].dropna().unique(), reverse=True)
+                    sel_years = st.sidebar.multiselect("Filtrar Ano", unique_years)
+                    if sel_years:
+                        df = df[df["Ano"].isin(sel_years)]
 
-            # Month Filter
-            month_col = None
-            for col in ['Mês', 'Mes', 'Month']:
-                if col in df.columns:
-                    month_col = col
-                    break
-            
-            if month_col:
-                month_map = {
-                    1: "Janeiro", 2: "Fevereiro", 3: "Março", 4: "Abril", 5: "Maio", 6: "Junho",
-                    7: "Julho", 8: "Agosto", 9: "Setembro", 10: "Outubro", 11: "Novembro", 12: "Dezembro"
-                }
-                all_months = list(range(1, 13))
-                def format_month(m):
-                    return f"{month_map.get(m, m)} ({m})"
+                # Month Filter
+                month_col = None
+                for col in ['Mês', 'Mes', 'Month']:
+                    if col in df.columns:
+                        month_col = col
+                        break
+                
+                if month_col:
+                    month_map = {
+                        1: "Janeiro", 2: "Fevereiro", 3: "Março", 4: "Abril", 5: "Maio", 6: "Junho",
+                        7: "Julho", 8: "Agosto", 9: "Setembro", 10: "Outubro", 11: "Novembro", 12: "Dezembro"
+                    }
+                    all_months = list(range(1, 13))
+                    def format_month(m):
+                        return f"{month_map.get(m, m)} ({m})"
 
-                sidebar_months = st.sidebar.multiselect("Filtrar Mês", all_months, format_func=format_month)
-                if sidebar_months:
-                    try:
-                        is_numeric = pd.to_numeric(df[month_col], errors='coerce')
-                        df = df[is_numeric.isin(sidebar_months)]
-                    except:
-                        pass
-            
-            # Well Filter
-            if "Poço" in df.columns:
-                unique_wells = sorted(df["Poço"].dropna().astype(str).unique())
-                sel_wells = st.sidebar.multiselect("Filtrar Poço", unique_wells)
-                if sel_wells:
-                    df = df[df["Poço"].isin(sel_wells)]
+                    sidebar_months = st.sidebar.multiselect("Filtrar Mês", all_months, format_func=format_month)
+                    if sidebar_months:
+                        try:
+                            is_numeric = pd.to_numeric(df[month_col], errors='coerce')
+                            df = df[is_numeric.isin(sidebar_months)]
+                        except:
+                            pass
+                
+                # Well Filter
+                if "Poço" in df.columns:
+                    unique_wells = sorted(df["Poço"].dropna().astype(str).unique())
+                    sel_wells = st.sidebar.multiselect("Filtrar Poço", unique_wells)
+                    if sel_wells:
+                        df = df[df["Poço"].isin(sel_wells)]
 
-            st.divider()
-            
-            # Show summary
-            col1, col2 = st.columns([1, 3])
-            col1.metric("Total Registros", f"{len(df):,}")
-            if st.session_state.get('campos_selecionados'):
-                col2.info(f"Campos: {', '.join(st.session_state['campos_selecionados'])}")
-            
-            st.dataframe(df)
-            
-            st.markdown("### Exportação")
-            if not df.empty:
-                excel_bytes = to_excel(df)
-                st.download_button(
-                    label="📥 Baixar Planilha Excel (.xlsx)",
-                    data=excel_bytes,
-                    file_name=f"Producao_ANP_{st.session_state['env']}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
+                st.divider()
+                
+                # Show summary
+                col1, col2 = st.columns([1, 3])
+                col1.metric("Total Registros", f"{len(df):,}")
+                if st.session_state.get('campos_selecionados'):
+                    col2.info(f"Campos: {', '.join(st.session_state['campos_selecionados'])}")
+                
+                st.dataframe(df)
+                
+                st.markdown("### Exportação")
+                if not df.empty:
+                    excel_bytes = to_excel(df)
+                    st.download_button(
+                        label="📥 Baixar Planilha Excel (.xlsx)",
+                        data=excel_bytes,
+                        file_name=f"Producao_ANP_{st.session_state['env']}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    )
     
     elif cached_campos:
         st.info("👈 Selecione Campos na barra lateral e clique em 'Carregar Dados'.")
